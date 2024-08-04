@@ -199,23 +199,6 @@ func (e *Engine) reloadImages() error {
 			Name:        "debian",
 			Version:     "bullseye",
 		},
-		"debian:buster": {
-			Archs: map[string]ImageArch{
-				"arm64": {
-					URL: "https://cloud.debian.org/images/cloud/buster/latest/debian-10-generic-arm64.qcow2",
-				},
-				"amd64": {
-					URL: "https://cloud.debian.org/images/cloud/buster/latest/debian-10-generic-amd64.qcow2",
-				},
-			},
-			engine:  e,
-			path:    e.imagePath("debian-buster"),
-			sshUser: "debian",
-
-			Description: "Debian 10 (Buster)",
-			Name:        "debian",
-			Version:     "buster",
-		},
 		"ubuntu:jammy": {
 			Archs: map[string]ImageArch{
 				"arm64": {
@@ -232,40 +215,6 @@ func (e *Engine) reloadImages() error {
 			Description: "Ubuntu Server 22.04 (Jammy Jellyfish)",
 			Name:        "ubuntu",
 			Version:     "jammy",
-		},
-		"ubuntu:impish": {
-			Archs: map[string]ImageArch{
-				"arm64": {
-					URL: "http://cloud-images.ubuntu.com/impish/current/impish-server-cloudimg-arm64.img",
-				},
-				"amd64": {
-					URL: "http://cloud-images.ubuntu.com/impish/current/impish-server-cloudimg-amd64.img",
-				},
-			},
-			engine:  e,
-			path:    e.imagePath("ubuntu-impish"),
-			sshUser: "ubuntu",
-
-			Description: "Ubuntu Server 21.10 (Impish Indri)",
-			Name:        "ubuntu",
-			Version:     "impish",
-		},
-		"ubuntu:hirsute": {
-			Archs: map[string]ImageArch{
-				"arm64": {
-					URL: "http://cloud-images.ubuntu.com/hirsute/current/hirsute-server-cloudimg-arm64.img",
-				},
-				"amd64": {
-					URL: "http://cloud-images.ubuntu.com/hirsute/current/hirsute-server-cloudimg-amd64.img",
-				},
-			},
-			engine:  e,
-			path:    e.imagePath("ubuntu-hirsute"),
-			sshUser: "ubuntu",
-
-			Description: "Ubuntu Server 21.04 (Hirsute Hippo)",
-			Name:        "ubuntu",
-			Version:     "hirsute",
 		},
 		"ubuntu:focal": {
 			Archs: map[string]ImageArch{
@@ -297,9 +246,23 @@ func (e *Engine) reloadImages() error {
 			path:    e.imagePath("ubuntu-noble"),
 			sshUser: "ubuntu",
 
-			Description: "Ubuntu Server 20.04 (Noble Numbat) LTS",
+			Description: "Ubuntu Server 24.04 (Noble Numbat) LTS",
 			Name:        "ubuntu",
 			Version:     "noble",
+		},
+		"kali:latest": {
+			Archs: map[string]ImageArch{
+				"amd64": {
+					URL: "https://cdimage.kali.org/kali-2024.2/kali-linux-2024.2-qemu-amd64.7z",
+				},
+			},
+			engine:  e,
+			path:    e.imagePath("kali-latest"),
+			sshUser: "kali",
+
+			Description: "Kali linux latest",
+			Name:        "kali",
+			Version:     "latest",
 		},
 	}
 
