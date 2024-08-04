@@ -1,0 +1,38 @@
+builds:
+  - goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  name_template: "{{ .ShortCommit }}"
+
+brews:
+  - tap:
+      owner: Igr1s-red
+      name: homebrew-tap
+    description: Spin up Linux VMs with QEMU
+    homepage: https://github.com/Igr1s-red/spinup
+    skip_upload: true
+    test: |
+      system "#{bin}/spinup -h"
+    install: |
+      bin.install "spinup"
+
+release:
+  github:
+    owner: Igr1s-red
+    name: spinup
+  disable: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
