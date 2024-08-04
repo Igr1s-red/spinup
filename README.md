@@ -2,9 +2,6 @@
 
 Spin up Linux VMs with QEMU.
 
-![Docker running on ARM64 Virtual Machine](/docs/docker.png)
-_In the above image: Docker running on ARM64 Ubuntu Virtual Machine._
-
 ## Requirements
 
 - Linux, macOS or Windows (needs testing) host OS.
