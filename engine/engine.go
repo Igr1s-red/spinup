@@ -250,20 +250,6 @@ func (e *Engine) reloadImages() error {
 			Name:        "ubuntu",
 			Version:     "noble",
 		},
-		"kali:latest": {
-			Archs: map[string]ImageArch{
-				"amd64": {
-					URL: "https://cdimage.kali.org/kali-2024.2/kali-linux-2024.2-qemu-amd64.7z",
-				},
-			},
-			engine:  e,
-			path:    e.imagePath("kali-latest"),
-			sshUser: "kali",
-
-			Description: "Kali linux latest",
-			Name:        "kali",
-			Version:     "latest",
-		},
 	}
 
 	keys := make([]string, 0, len(images))
