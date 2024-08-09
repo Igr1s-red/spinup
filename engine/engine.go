@@ -144,22 +144,22 @@ func (e *Engine) reloadVirtualMachines() error {
 
 func (e *Engine) reloadImages() error {
 	images := map[string]*Image{
-		"fedora:38": {
+		"fedora:40": {
 			Archs: map[string]ImageArch{
 				"arm64": {
-					URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/aarch64/images/Fedora-Cloud-Base-38-1.6.aarch64.qcow2",
+					URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/aarch64/images/Fedora-Cloud-Base-Generic.aarch64-40-1.14.qcow2",
 				},
 				"amd64": {
-					URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/x86_64/images/Fedora-Cloud-Base-38-1.6.x86_64.qcow2",
+					URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2",
 				},
 			},
 			engine:  e,
-			path:    e.imagePath("fedora-38"),
+			path:    e.imagePath("fedora-40"),
 			sshUser: "fedora",
 
-			Description: "Fedora 38",
+			Description: "Fedora 40",
 			Name:        "fedora",
-			Version:     "38",
+			Version:     "40",
 		},
 		"debian:bookworm": {
 			Archs: map[string]ImageArch{
