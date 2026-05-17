@@ -7,13 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-type xtermOptions struct {
-	*globalOptions
-	name string
-}
-
 func newXtermCommand() *cobra.Command {
-	cmd := &cobra.Command{
+	return &cobra.Command{
 		Args:  cobra.ExactArgs(1),
 		Short: "Connect via SSH to a running virtual machine",
 		Use:   "xterm [name]",
@@ -22,34 +17,17 @@ func newXtermCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
-			opts := &xtermOptions{
-				name:          args[0],
-				globalOptions: globalOptions,
-			}
-
-			if err := runXterm(opts); err != nil {
+			eng, err := newEngine(globalOptions)
+			if err != nil {
 				fmt.Printf("Error: %s\n", err)
 				os.Exit(1)
 			}
-
+			vm := mustFindVM(eng, args[0])
+			if err := vm.SSHSessionWithXterm(); err != nil {
+				fmt.Printf("Error: %s\n", err)
+				os.Exit(1)
+			}
 			return nil
 		},
 	}
-
-	return cmd
-}
-
-func runXterm(opts *xtermOptions) error {
-	eng, err := newEngine(opts.globalOptions)
-	if err != nil {
-		return err
-	}
-
-	vm := eng.FindVirtualMachine(opts.name)
-	if vm == nil {
-		return fmt.Errorf(`virtual machine "%s" not found`, opts.name)
-	}
-
-	return vm.SSHSessionWithXterm()
 }

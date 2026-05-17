@@ -1,303 +1,453 @@
 package engine
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
+	"context"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"os/exec"
-	"path"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
-	"github.com/Igr1s-red/spinup/cloudinit"
 	"github.com/Igr1s-red/spinup/qemu"
-	"golang.org/x/crypto/ssh"
+	goxssh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
-type SSHConnectionDetails struct {
-	Host       string
-	Port       int
-	Username   string
-	PrivateKey string
+// validName restricts VM and profile names to filesystem-safe characters.
+var validName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// ── Config types ──────────────────────────────────────────────────────────────
+
+// NetworkInterfaceConfig persists one NIC in config.json.
+type NetworkInterfaceConfig struct {
+	MACAddress   string            `json:"mac_address"`
+	NetworkMode  string            `json:"network_mode"`
+	PortForwards map[string]string `json:"port_forwards,omitempty"`
 }
 
+// SharedFolder is a host directory exposed to the VM via VirtIO 9P.
+// Guest mount: mount -t 9p -o trans=virtio,version=9p2000.L <tag> /mnt/pt
+type SharedFolder struct {
+	HostPath string `json:"host_path"`
+	Tag      string `json:"tag"`
+}
+
+// VirtualMachineConfig is persisted as config.json alongside the VM data.
+// All JSON keys use snake_case for consistency.
+type VirtualMachineConfig struct {
+	CPU           int                      `json:"cpu"`
+	Memory        int                      `json:"memory_mib"`
+	DiskSize      int                      `json:"disk_size_gb"`
+	Image         string                   `json:"image"`
+	SSHUser       string                   `json:"ssh_user"`
+	Networks      []NetworkInterfaceConfig `json:"networks"`
+	SharedFolders []SharedFolder           `json:"shared_folders,omitempty"`
+	// Ephemeral VMs remove themselves when stopped.
+	Ephemeral bool `json:"ephemeral,omitempty"`
+}
+
+// sshPort returns the host port forwarded to VM port 22, or "".
+func (c *VirtualMachineConfig) sshPort() string {
+	if len(c.Networks) == 0 || c.Networks[0].PortForwards == nil {
+		return ""
+	}
+	return c.Networks[0].PortForwards["22"]
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
+
+// VirtualMachineStatus is the observable state of a VM process.
 type VirtualMachineStatus string
 
 const (
 	VirtualMachineStatusStopped VirtualMachineStatus = "stopped"
 	VirtualMachineStatusRunning VirtualMachineStatus = "running"
-	VirtualMachineStatusError   VirtualMachineStatus = "error"
 )
 
-type VirtualMachineConfig struct {
-	CPU          int
-	Memory       int
-	DiskSize     int
-	Image        string
-	SSHUser      string
-	MacAddress   string
-	PortForwards map[string]string
+// SSHConnectionDetails holds everything needed to reach the VM via SSH.
+type SSHConnectionDetails struct {
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	Username   string `json:"username"`
+	PrivateKey string `json:"private_key"`
 }
 
+// VirtualMachineInfo is returned by Inspect().
+type VirtualMachineInfo struct {
+	Name       string                `json:"name"`
+	Status     VirtualMachineStatus  `json:"status"`
+	Config     VirtualMachineConfig  `json:"config"`
+	SSHDetails *SSHConnectionDetails `json:"ssh,omitempty"`
+	LogPath    string                `json:"log_path"`
+	DiskPath   string                `json:"disk_path"`
+}
+
+// ── VM struct ─────────────────────────────────────────────────────────────────
+
+// VirtualMachine is a configured, named QEMU virtual machine.
 type VirtualMachine struct {
 	Name   string
 	Config VirtualMachineConfig
 
 	engine *Engine
-	path   string
+	path   string // absolute path to the VM's data directory
 }
 
-func (v *VirtualMachine) makePath() error {
-	return os.MkdirAll(v.path, 0755)
+// ── Path helpers ──────────────────────────────────────────────────────────────
+
+func (v *VirtualMachine) pidPath() string           { return filepath.Join(v.path, "pid") }
+func (v *VirtualMachine) diskPath() string          { return filepath.Join(v.path, "disk.qcow2") }
+func (v *VirtualMachine) cloudInitPath() string     { return filepath.Join(v.path, "cloud-init.iso") }
+func (v *VirtualMachine) configPath() string        { return filepath.Join(v.path, "config.json") }
+func (v *VirtualMachine) privateKeyPath() string    { return filepath.Join(v.path, "key.pem") }
+func (v *VirtualMachine) publicKeyPath() string     { return filepath.Join(v.path, "key.pub") }
+func (v *VirtualMachine) logPath() string           { return filepath.Join(v.path, "qemu.log") }
+func (v *VirtualMachine) monitorSocketPath() string { return filepath.Join(v.path, "monitor.sock") }
+func (v *VirtualMachine) consoleSocketPath() string { return filepath.Join(v.path, "console.sock") }
+
+// writeFile creates v.path if needed and writes data with the given permission.
+// Pass 0644 for normal files, 0600 for private keys.
+func (v *VirtualMachine) writeFile(name string, data []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(v.path, 0755); err != nil {
+		return fmt.Errorf("create VM directory: %w", err)
+	}
+	return os.WriteFile(name, data, perm)
 }
 
-func (v *VirtualMachine) writeFile(name string, bytes []byte) error {
-	if err := v.makePath(); err != nil {
-		return err
+// ── Config persistence ────────────────────────────────────────────────────────
+
+// writeConfigFile writes config.json atomically via a temp file + rename.
+// This prevents a crash mid-write from leaving a corrupt config on disk.
+func (v *VirtualMachine) writeConfigFile() error {
+	b, err := json.MarshalIndent(v.Config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
 	}
 
-	return os.WriteFile(name, bytes, 0644)
-}
-
-func (v *VirtualMachine) writeFilePerm(name string, bytes []byte, perm os.FileMode) error {
-	if err := v.makePath(); err != nil {
+	tmp := v.configPath() + ".tmp"
+	if err := v.writeFile(tmp, b, 0644); err != nil {
 		return err
 	}
-
-	return os.WriteFile(name, bytes, perm)
+	if err := os.Rename(tmp, v.configPath()); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("commit config: %w", err)
+	}
+	return nil
 }
 
-func (v *VirtualMachine) pidPath() string {
-	return path.Join(v.path, "pid")
+func (v *VirtualMachine) loadConfigFile() error {
+	b, err := os.ReadFile(v.configPath())
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	if err := json.Unmarshal(b, &v.Config); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	return nil
 }
 
-func (v *VirtualMachine) diskPath() string {
-	return path.Join(v.path, "disk.qcow2")
+// ── Process helpers ───────────────────────────────────────────────────────────
+
+func (v *VirtualMachine) findProcess() (*os.Process, error) {
+	b, err := os.ReadFile(v.pidPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read pid: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return nil, fmt.Errorf("parse pid: %w", err)
+	}
+	return os.FindProcess(pid)
 }
 
-func (v *VirtualMachine) cloudInitPath() string {
-	return path.Join(v.path, "cloud-init.iso")
-}
+// ── Status ────────────────────────────────────────────────────────────────────
 
-func (v *VirtualMachine) configPath() string {
-	return path.Join(v.path, "config.json")
-}
-
-func (v *VirtualMachine) privateKeyPath() string {
-	return path.Join(v.path, "key.pem")
-}
-
-func (v *VirtualMachine) publicKeyPath() string {
-	return path.Join(v.path, "key.pub")
-}
-
-// Status returns the status of the virtual machine
+// Status reports whether the QEMU process is alive.
 func (v *VirtualMachine) Status() (VirtualMachineStatus, error) {
 	proc, err := v.findProcess()
 	if err != nil {
 		return VirtualMachineStatusStopped, err
 	}
-
 	if proc == nil {
 		return VirtualMachineStatusStopped, nil
 	}
-
-	// check if is running with a signal
+	// Signal 0 checks existence without delivering an actual signal.
 	if err := proc.Signal(syscall.Signal(0)); err != nil {
 		return VirtualMachineStatusStopped, nil
 	}
-
 	return VirtualMachineStatusRunning, nil
 }
 
-// Start starts the virtual machine
-func (v *VirtualMachine) Start() error {
-	v.engine.Printf("Starting virtual machine \"%s\"\n", v.Name)
-
-	// get the status
-	status, err := v.Status()
+// requireStopped returns ErrVirtualMachineAlreadyRunning if the VM is running.
+func (v *VirtualMachine) requireStopped() error {
+	s, err := v.Status()
 	if err != nil {
 		return err
 	}
-
-	// check the status
-	if status == VirtualMachineStatusRunning {
+	if s == VirtualMachineStatusRunning {
 		return ErrVirtualMachineAlreadyRunning
 	}
-
-	// use the driver to create the start command
-	cmd, err := v.engine.qemu.Command(qemu.CommandOptions{
-		CPU:        v.Config.CPU,
-		Memory:     v.Config.Memory,
-		MACAddress: v.Config.MacAddress,
-		Disks: []qemu.CommandOptionsDisk{
-			{
-				Path: v.diskPath(),
-			},
-			{
-				Path:     v.cloudInitPath(),
-				ReadOnly: true,
-			},
-		},
-		PortForwards: v.Config.PortForwards,
-	})
-	if err != nil {
-		return err
-	}
-
-	v.engine.Printf("Running command: %s\n", strings.Join(cmd.Args, " "))
-
-	// start the command
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	// write the process id to disk
-	if err := v.writeFile(v.pidPath(), []byte(strconv.Itoa(cmd.Process.Pid))); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-// writeConfigFile writes the config file
-func (v *VirtualMachine) writeConfigFile() error {
-	configBytes, err := json.Marshal(v.Config)
+// requireRunning returns ErrVirtualMachineNotRunning if the VM is not running.
+func (v *VirtualMachine) requireRunning() error {
+	s, err := v.Status()
 	if err != nil {
 		return err
 	}
-
-	return v.writeFile(v.configPath(), configBytes)
-}
-
-// loadConfigFile loads the config file
-func (v *VirtualMachine) loadConfigFile() error {
-	configBytes, err := os.ReadFile(v.configPath())
-	if err != nil {
-		return err
-	}
-
-	return json.Unmarshal(configBytes, &v.Config)
-}
-
-// findProcess returns the running process if exist
-func (v *VirtualMachine) findProcess() (*os.Process, error) {
-	pidFileBytes, err := os.ReadFile(v.pidPath())
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-
-		return nil, err
-	}
-
-	pid, err := strconv.Atoi(strings.ReplaceAll(string(pidFileBytes), "\n", ""))
-	if err != nil {
-		return nil, err
-	}
-
-	return os.FindProcess(pid)
-}
-
-// Stop stops the virtual machine
-func (v *VirtualMachine) Stop() error {
-	status, err := v.Status()
-	if err != nil {
-		return err
-	}
-
-	if status != VirtualMachineStatusRunning {
+	if s != VirtualMachineStatusRunning {
 		return ErrVirtualMachineNotRunning
 	}
+	return nil
+}
 
-	v.engine.Printf("Stopping virtual machine \"%s\"\n", v.Name)
+// isEphemeral reports whether the VM should remove itself when stopped.
+// Defined here; vm_autostart.go must not redeclare it.
+func (v *VirtualMachine) isEphemeral() bool { return v.Config.Ephemeral }
 
+// ── Start ─────────────────────────────────────────────────────────────────────
+
+// StartOptions allows per-run resource overrides without changing stored config.
+type StartOptions struct {
+	CPU    int // > 0 overrides stored value for this run only
+	Memory int // > 0 overrides stored value (MiB) for this run only
+}
+
+// Start starts the VM with its stored configuration.
+func (v *VirtualMachine) Start() error { return v.StartWithOptions(StartOptions{}) }
+
+// StartWithOptions starts the VM with optional per-run overrides.
+// If QEMU cannot bind the SSH port (TOCTOU race), it retries up to 3 times
+// with a freshly allocated port.
+func (v *VirtualMachine) StartWithOptions(opts StartOptions) error {
+	if err := v.requireStopped(); err != nil {
+		return err
+	}
+
+	cpu := v.Config.CPU
+	if opts.CPU > 0 {
+		cpu = opts.CPU
+		v.engine.printf("CPU override: %d\n", cpu)
+	}
+
+	memory := v.Config.Memory
+	if opts.Memory > 0 {
+		memory = opts.Memory
+		v.engine.printf("Memory override: %d MiB\n", memory)
+	}
+
+	v.engine.printf("Starting VM %q (cpu=%d mem=%dMiB)\n", v.Name, cpu, memory)
+
+	// Pre-build shared folder list — constant across retries.
+	qFolders := make([]qemu.SharedFolder, len(v.Config.SharedFolders))
+	for i, sf := range v.Config.SharedFolders {
+		qFolders[i] = qemu.SharedFolder{HostPath: sf.HostPath, Tag: sf.Tag}
+	}
+
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Rebuild NICs each attempt so a reallocated port is picked up.
+		ifaces := make([]qemu.NetworkInterface, len(v.Config.Networks))
+		for i, n := range v.Config.Networks {
+			ifaces[i] = qemu.NetworkInterface{
+				MACAddress:   n.MACAddress,
+				Mode:         qemu.NetworkMode(n.NetworkMode),
+				PortForwards: n.PortForwards,
+			}
+		}
+
+		cmd, err := v.engine.qemu.Command(qemu.CommandOptions{
+			CPU:               cpu,
+			Memory:            memory,
+			Disks:             []qemu.CommandOptionsDisk{{Path: v.diskPath()}, {Path: v.cloudInitPath(), ReadOnly: true}},
+			Interfaces:        ifaces,
+			SharedFolders:     qFolders,
+			MonitorSocketPath: v.monitorSocketPath(),
+			ConsoleSocketPath: v.consoleSocketPath(),
+		})
+		if err != nil {
+			return fmt.Errorf("build QEMU command: %w", err)
+		}
+
+		v.engine.printf("Command: %s\n", strings.Join(cmd.Args, " "))
+
+		logFile, err := os.OpenFile(v.logPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return fmt.Errorf("open log: %w", err)
+		}
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+		startErr := cmd.Start()
+		logFile.Close()
+
+		if startErr == nil {
+			return v.writeFile(v.pidPath(), []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
+		}
+
+		if attempt < maxRetries && isPortInUse(startErr) {
+			v.engine.printf("SSH port conflict (attempt %d) — reassigning...\n", attempt)
+			if err := v.reassignSSHPort(); err != nil {
+				return err
+			}
+			continue
+		}
+		return fmt.Errorf("start QEMU: %w", startErr)
+	}
+	return fmt.Errorf("start QEMU: port conflict persists after %d attempts", maxRetries)
+}
+
+func (v *VirtualMachine) reassignSSHPort() error {
+	// Use 127.0.0.1:0 to guarantee a loopback address is returned.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("allocate free port: %w", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+
+	if len(v.Config.Networks) == 0 {
+		return fmt.Errorf("no network interfaces configured")
+	}
+	if v.Config.Networks[0].PortForwards == nil {
+		v.Config.Networks[0].PortForwards = map[string]string{}
+	}
+	v.Config.Networks[0].PortForwards["22"] = strconv.Itoa(port)
+	return v.writeConfigFile()
+}
+
+func isPortInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "address already in use") ||
+		strings.Contains(s, "bind: can't assign requested address")
+}
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
+
+// Stop shuts down the VM. It attempts graceful ACPI shutdown via QMP first,
+// waiting up to 15 s before falling back to SIGKILL.
+func (v *VirtualMachine) Stop() error {
+	if err := v.requireRunning(); err != nil {
+		return err
+	}
+
+	v.engine.printf("Stopping VM %q\n", v.Name)
+
+	// Graceful path: ACPI power-down via QMP.
+	if qmp, err := qemu.NewQMPClient(v.monitorSocketPath()); err == nil {
+		if powerErr := qmp.SystemPowerdown(); powerErr == nil {
+			qmp.Close()
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				time.Sleep(500 * time.Millisecond)
+				if s, _ := v.Status(); s == VirtualMachineStatusStopped {
+					os.Remove(v.pidPath())
+					return v.postStop()
+				}
+			}
+			v.engine.printf("Graceful shutdown timed out — killing\n")
+		} else {
+			qmp.Close()
+		}
+	}
+
+	// Fallback: SIGKILL.
 	proc, err := v.findProcess()
 	if err != nil {
 		return err
 	}
-
 	if proc == nil {
 		return ErrVirtualMachineNotRunning
 	}
-
 	if err := proc.Kill(); err != nil {
-		return err
+		return fmt.Errorf("kill: %w", err)
 	}
-
-	if err := os.Remove(v.pidPath()); err != nil {
-		return err
+	if err := os.Remove(v.pidPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove pid: %w", err)
 	}
+	return v.postStop()
+}
 
+// postStop runs cleanup after the VM process exits.
+func (v *VirtualMachine) postStop() error {
+	if v.isEphemeral() {
+		v.engine.printf("VM %q is ephemeral — removing\n", v.Name)
+		return v.Remove()
+	}
 	return nil
 }
 
-// Remove stops and remove the virtual machine
-func (v *VirtualMachine) Remove() error {
-	status, err := v.Status()
-	if err != nil {
-		return err
-	}
+// ── Remove ────────────────────────────────────────────────────────────────────
 
-	if status != VirtualMachineStatusStopped {
+// Remove stops the VM if running, then deletes all its data.
+func (v *VirtualMachine) Remove() error {
+	if s, err := v.Status(); err != nil {
+		return err
+	} else if s == VirtualMachineStatusRunning {
 		if err := v.Stop(); err != nil {
 			return err
 		}
 	}
-
-	v.engine.Printf("Removing virtual machine \"%s\"\n", v.Name)
-
+	// Best-effort: clean up SSH config before the data directory is gone.
+	if err := v.SSHConfigRemove(); err != nil {
+		v.engine.printf("Warning: could not remove SSH config entry: %s\n", err)
+	}
+	v.engine.printf("Removing VM %q\n", v.Name)
 	if err := os.RemoveAll(v.path); err != nil {
-		return err
+		return fmt.Errorf("remove VM data: %w", err)
 	}
-
+	delete(v.engine.virtualMachines, v.Name)
 	return nil
 }
 
+// ── SSH helpers ───────────────────────────────────────────────────────────────
+
+func (v *VirtualMachine) sshClient() (*goxssh.Client, error) {
+	port := v.Config.sshPort()
+	if port == "" {
+		return nil, ErrInvalidSSHPort
+	}
+
+	keyBytes, err := os.ReadFile(v.privateKeyPath())
+	if err != nil {
+		return nil, fmt.Errorf("read private key: %w", err)
+	}
+
+	signer, err := goxssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+
+	return goxssh.Dial("tcp", "127.0.0.1:"+port, &goxssh.ClientConfig{
+		User:            v.Config.SSHUser,
+		Auth:            []goxssh.AuthMethod{goxssh.PublicKeys(signer)},
+		HostKeyCallback: goxssh.InsecureIgnoreHostKey(), //nolint:gosec
+		BannerCallback:  goxssh.BannerDisplayStderr(),
+		Timeout:         10 * time.Second,
+	})
+}
+
+// SSHSessionWithXterm opens an interactive SSH session with a PTY.
 func (v *VirtualMachine) SSHSessionWithXterm() error {
-	status, err := v.Status()
-	if err != nil {
+	if err := v.requireRunning(); err != nil {
 		return err
 	}
+	v.engine.printf("Connecting to %q via SSH\n", v.Name)
 
-	if status != VirtualMachineStatusRunning {
-		return ErrVirtualMachineNotRunning
-	}
-
-	v.engine.Printf("Connecting to virtual machine \"%s\" via SSH\n", v.Name)
-
-	sshPort, exist := v.Config.PortForwards["22"]
-	if !exist || sshPort == "" {
-		return ErrInvalidSSHPort
-	}
-
-	privateKeyBytes, err := os.ReadFile(v.privateKeyPath())
-	if err != nil {
-		return err
-	}
-
-	sshSigner, err := ssh.ParsePrivateKey(privateKeyBytes)
-	if err != nil {
-		return err
-	}
-
-	client, err := ssh.Dial("tcp", fmt.Sprintf("localhost:%s", sshPort), &ssh.ClientConfig{
-		User: v.Config.SSHUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(sshSigner),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		BannerCallback:  ssh.BannerDisplayStderr(),
-	})
+	client, err := v.sshClient()
 	if err != nil {
 		return err
 	}
@@ -305,71 +455,31 @@ func (v *VirtualMachine) SSHSessionWithXterm() error {
 
 	session, err := client.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("new session: %w", err)
 	}
 	defer session.Close()
 
-	session.Stderr = os.Stderr
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
+	session.Stdin, session.Stdout, session.Stderr = os.Stdin, os.Stdout, os.Stderr
 
-	terminalWidth, terminalHeight, err := terminal.GetSize(int(os.Stdout.Fd()))
+	w, h, err := terminal.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
-		return err
+		w, h = 80, 24 // safe fallback if not a real terminal
 	}
-
-	if err := session.RequestPty("xterm-256color", terminalHeight, terminalWidth, ssh.TerminalModes{
-		// ssh.ECHO:          0,
-		// ssh.TTY_OP_ISPEED: 14400,
-		// ssh.TTY_OP_OSPEED: 14400,
-	}); err != nil {
-		return err
+	if err := session.RequestPty("xterm-256color", h, w, goxssh.TerminalModes{}); err != nil {
+		return fmt.Errorf("request PTY: %w", err)
 	}
-
 	if err := session.Shell(); err != nil {
-		return err
+		return fmt.Errorf("start shell: %w", err)
 	}
-
-	if err := session.Wait(); err != nil {
-		return err
-	}
-
-	return nil
+	return session.Wait()
 }
 
-func (v *VirtualMachine) Exec(cmd string) error {
-	status, err := v.Status()
-	if err != nil {
+// Exec runs a single command inside the VM over SSH.
+func (v *VirtualMachine) Exec(command string) error {
+	if err := v.requireRunning(); err != nil {
 		return err
 	}
-
-	if status != VirtualMachineStatusRunning {
-		return ErrVirtualMachineNotRunning
-	}
-
-	sshPort, exist := v.Config.PortForwards["22"]
-	if !exist || sshPort == "" {
-		return ErrInvalidSSHPort
-	}
-
-	privateKeyBytes, err := os.ReadFile(v.privateKeyPath())
-	if err != nil {
-		return err
-	}
-
-	sshSigner, err := ssh.ParsePrivateKey(privateKeyBytes)
-	if err != nil {
-		return err
-	}
-
-	client, err := ssh.Dial("tcp", fmt.Sprintf("localhost:%s", sshPort), &ssh.ClientConfig{
-		User: v.Config.SSHUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(sshSigner),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		BannerCallback:  ssh.BannerDisplayStderr(),
-	})
+	client, err := v.sshClient()
 	if err != nil {
 		return err
 	}
@@ -377,184 +487,237 @@ func (v *VirtualMachine) Exec(cmd string) error {
 
 	session, err := client.NewSession()
 	if err != nil {
-		return err
+		return fmt.Errorf("new session: %w", err)
 	}
 	defer session.Close()
 
-	session.Stderr = os.Stderr
-	session.Stdout = os.Stdout
-
-	if err := session.Run(cmd); err != nil {
-		return err
-	}
-
-	return nil
+	session.Stdout, session.Stderr = os.Stdout, os.Stderr
+	return session.Run(command)
 }
 
+// SSHConnectionDetails returns SSH connection info. VM must be running.
 func (v *VirtualMachine) SSHConnectionDetails() (*SSHConnectionDetails, error) {
-	status, err := v.Status()
-	if err != nil {
+	if err := v.requireRunning(); err != nil {
 		return nil, err
 	}
-
-	if status != VirtualMachineStatusRunning {
-		return nil, ErrVirtualMachineNotRunning
-	}
-
-	sshPort, exist := v.Config.PortForwards["22"]
-	if !exist || sshPort == "" {
+	port := v.Config.sshPort()
+	if port == "" {
 		return nil, ErrInvalidSSHPort
 	}
-
-	sshPortI, err := strconv.Atoi(sshPort)
+	portI, err := strconv.Atoi(port)
 	if err != nil {
 		return nil, ErrInvalidSSHPort
 	}
-
 	return &SSHConnectionDetails{
-		Host:       "localhost",
-		Port:       sshPortI,
+		Host:       "127.0.0.1",
+		Port:       portI,
 		Username:   v.Config.SSHUser,
 		PrivateKey: v.privateKeyPath(),
 	}, nil
 }
 
-// FindVirtualMachine returns the virtual machine if exist
-func (e *Engine) FindVirtualMachine(name string) *VirtualMachine {
-	virtualMachine, exist := e.virtualMachines[name]
-	if !exist {
+// scp runs an scp command with the VM's stored key and port.
+func (v *VirtualMachine) scp(src, dst string) error {
+	port := v.Config.sshPort()
+	if port == "" {
+		return ErrInvalidSSHPort
+	}
+	cmd := scpCmd(v.privateKeyPath(), port, src, dst)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("scp %s → %s: %w", src, dst, err)
+	}
+	return nil
+}
+
+// CopyFrom downloads a file from the VM to the local filesystem.
+func (v *VirtualMachine) CopyFrom(remotePath, localPath string) error {
+	if err := v.requireRunning(); err != nil {
+		return err
+	}
+	return v.scp(fmt.Sprintf("%s@127.0.0.1:%s", v.Config.SSHUser, remotePath), localPath)
+}
+
+// CopyTo uploads a local file into the VM.
+func (v *VirtualMachine) CopyTo(localPath, remotePath string) error {
+	if err := v.requireRunning(); err != nil {
+		return err
+	}
+	return v.scp(localPath, fmt.Sprintf("%s@127.0.0.1:%s", v.Config.SSHUser, remotePath))
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────────
+
+// Logs streams the QEMU console log to stdout.
+// When follow is true it behaves like tail -F: it polls every 250 ms and
+// handles log rotation caused by VM restarts (O_TRUNC on the same path).
+// ctx cancellation stops the follow loop cleanly.
+func (v *VirtualMachine) Logs(ctx context.Context, follow bool) error {
+	logPath := v.logPath()
+
+	f, err := os.Open(logPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return ErrVirtualMachineLogNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("open log: %w", err)
+	}
+
+	if _, err := io.Copy(os.Stdout, f); err != nil {
+		f.Close()
+		return fmt.Errorf("stream log: %w", err)
+	}
+	if !follow {
+		f.Close()
 		return nil
 	}
 
-	return virtualMachine
+	fi, _ := f.Stat()
+	buf := make([]byte, 32*1024)
+
+	// reopen closes the current file and opens a fresh handle to logPath,
+	// updating f and fi in the enclosing scope.
+	reopen := func() error {
+		f.Close()
+		var openErr error
+		f, openErr = os.Open(logPath)
+		if openErr != nil {
+			return fmt.Errorf("reopen log: %w", openErr)
+		}
+		fi, _ = f.Stat()
+		return nil
+	}
+
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if _, werr := os.Stdout.Write(buf[:n]); werr != nil {
+				f.Close()
+				return werr
+			}
+		}
+
+		if readErr == io.EOF {
+			// Detect log rotation: O_TRUNC (same inode, smaller size) or
+			// delete+recreate (different inode).
+			if diskFi, statErr := os.Stat(logPath); statErr == nil {
+				if !os.SameFile(fi, diskFi) {
+					if err := reopen(); err != nil {
+						return err
+					}
+				} else {
+					curPos, _ := f.Seek(0, io.SeekCurrent)
+					if diskFi.Size() < curPos {
+						f.Seek(0, io.SeekStart) //nolint:errcheck
+						fi = diskFi
+					}
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				f.Close()
+				return nil
+			case <-time.After(250 * time.Millisecond):
+			}
+			continue
+		}
+
+		if readErr != nil {
+			f.Close()
+			return fmt.Errorf("read log: %w", readErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil
+		default:
+		}
+	}
 }
 
-// ListVirtualMachines returns a slice of loaded virtual machines
-func (e *Engine) ListVirtualMachines() []*VirtualMachine {
-	virtualMachines := make([]*VirtualMachine, 0, len(e.virtualMachines))
-	for _, vm := range e.virtualMachines {
-		virtualMachines = append(virtualMachines, vm)
+// ── Inspect ───────────────────────────────────────────────────────────────────
+
+// Inspect returns a full snapshot of the VM's state as a JSON-serialisable struct.
+func (v *VirtualMachine) Inspect() (*VirtualMachineInfo, error) {
+	status, err := v.Status()
+	if err != nil {
+		return nil, err
 	}
 
-	return virtualMachines
+	info := &VirtualMachineInfo{
+		Name:     v.Name,
+		Status:   status,
+		Config:   v.Config,
+		LogPath:  v.logPath(),
+		DiskPath: v.diskPath(),
+	}
+	if status == VirtualMachineStatusRunning {
+		if d, err := v.SSHConnectionDetails(); err == nil {
+			info.SSHDetails = d
+		}
+	}
+	return info, nil
 }
 
-// CreateVirtualMachine creates and start a new virtual machine
-func (e *Engine) CreateVirtualMachine(opts CreateVirtualMachineOptions) (*VirtualMachine, error) {
-	// try to find a virtual machine with the same name
-	virtualMachineCheck := e.FindVirtualMachine(opts.Name)
-	if virtualMachineCheck != nil {
-		return nil, ErrVirtualMachineAlreadyExist
-	}
+// ── Port-forward management ───────────────────────────────────────────────────
 
-	// try to find the image
-	image := e.FindImage(opts.Image)
-	if image == nil {
-		return nil, ErrImageNotFound
-	}
-
-	// check that the image is pulled
-	imagePulled, err := image.Pulled()
-	if err != nil {
-		return nil, err
-	}
-
-	if !imagePulled {
-		e.Printf("Unable to find image \"%s\" locally\n", opts.Image)
-
-		// pull the image
-		if err := image.Pull(); err != nil {
-			return nil, err
+// AddPortForward adds a host→VM port forward to the primary NIC.
+// The VM must be stopped; takes effect on next start.
+func (v *VirtualMachine) AddPortForward(hostPort, vmPort string) error {
+	if err := v.requireStopped(); err != nil {
+		if err == ErrVirtualMachineAlreadyRunning {
+			return ErrPortForwardVMRunning
 		}
+		return err
 	}
-
-	e.Printf("Creating virtual machine \"%s\" with image \"%s\"\n", opts.Name, opts.Image)
-
-	macAddress, err := e.RandomLocallyAdministeredMacAddress()
-	if err != nil {
-		return nil, err
+	if len(v.Config.Networks) == 0 {
+		return fmt.Errorf("no network interfaces configured")
 	}
+	if v.Config.Networks[0].PortForwards == nil {
+		v.Config.Networks[0].PortForwards = map[string]string{}
+	}
+	v.Config.Networks[0].PortForwards[vmPort] = hostPort
+	return v.writeConfigFile()
+}
 
-	e.Printf("Using %s as MAC address\n", macAddress)
-
-	sshPort, exist := opts.PortForwards["22"]
-	if !exist || sshPort == "" {
-		// start a tcp listener to find an unused port
-		listener, err := net.Listen("tcp", ":0")
-		if err != nil {
-			return nil, err
+// RemovePortForward removes a forward by VM port from the primary NIC.
+// The VM must be stopped.
+func (v *VirtualMachine) RemovePortForward(vmPort string) error {
+	if err := v.requireStopped(); err != nil {
+		if err == ErrVirtualMachineAlreadyRunning {
+			return ErrPortForwardVMRunning
 		}
-
-		// get the assigned port
-		sshPortI := listener.Addr().(*net.TCPAddr).Port
-
-		// stop the tcp lister
-		if err := listener.Close(); err != nil {
-			return nil, err
-		}
-
-		opts.PortForwards["22"] = strconv.Itoa(sshPortI)
+		return err
 	}
-
-	e.Printf("Using %s as SSH port forward\n", opts.PortForwards["22"])
-
-	// get the virtual machine path
-	virtualMachinePath := e.virtualMachinePath(opts.Name)
-
-	// create the virtual machine struct
-	virtualMachine := &VirtualMachine{
-		Name:   opts.Name,
-		engine: e,
-		path:   virtualMachinePath,
-		Config: VirtualMachineConfig{
-			CPU:          opts.CPU,
-			Memory:       opts.Memory,
-			Image:        opts.Image,
-			SSHUser:      image.sshUser,
-			DiskSize:     opts.DiskSize,
-			MacAddress:   macAddress,
-			PortForwards: opts.PortForwards,
-		},
+	if len(v.Config.Networks) == 0 {
+		return ErrPortForwardNotFound
 	}
-
-	e.Printf("Generating a new SSH key\n")
-
-	// generate a new rsa key for ssh
-	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		return nil, err
+	pf := v.Config.Networks[0].PortForwards
+	if _, ok := pf[vmPort]; !ok {
+		return ErrPortForwardNotFound
 	}
+	delete(pf, vmPort)
+	return v.writeConfigFile()
+}
 
-	// encode the key to pem format
-	privateKeyPEMBytes := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-	})
 
-	// write the private key
-	if err := virtualMachine.writeFilePerm(virtualMachine.privateKeyPath(), privateKeyPEMBytes, 0600); err != nil {
-		return nil, err
-	}
+// ── CreateVirtualMachine ──────────────────────────────────────────────────────
 
-	// create the public key for ssh
-	sshPublicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return nil, err
-	}
+// cloudInitTemplate is the default cloud-init user-data. It disables SSH
+// password auth (key-only) and leaves a console password for emergency access.
+// %s is replaced with the VM's SSH authorized key line.
+const cloudInitTemplate = "#cloud-config\n\n" +
+	"password: password\n" +
+	"chpasswd: { expire: False }\n" +
+	"ssh_pwauth: False\n" +
+	"ssh_authorized_keys:\n" +
+	"  - %s"
 
-	// marshal the data for ssh authorized keys
-	publicKeyBytes := ssh.MarshalAuthorizedKey(sshPublicKey)
-
-	// write the public key
-	if err := virtualMachine.writeFile(virtualMachine.publicKeyPath(), publicKeyBytes); err != nil {
-		return nil, err
-	}
-
-	e.Printf("Creating cloud-init ISO\n")
-
-	// create cloud init data
-	cloudInitUserData := fmt.Sprintf("#cloud-config\n\npassword: password\nchpasswd: { expire: False }\nssh_pwauth: True\nssh_authorized_keys:\n  - %s", string(publicKeyBytes))
-	cloudInitNetworkConfig := `version: 2
+// cloudInitNetworkConfig enables DHCP on any enp* interface (networkd v2).
+const cloudInitNetworkConfig = `version: 2
 ethernets:
   interface0:
     match:
@@ -562,50 +725,118 @@ ethernets:
     dhcp4: true
     dhcp6: true
 `
-	cloudInitMetaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", virtualMachine.Name, virtualMachine.Name)
 
-	// create cloud init iso
-	if err := cloudinit.New(cloudinit.NewOptions{
-		MetaData:      cloudInitMetaData,
-		Name:          virtualMachine.cloudInitPath(),
-		NetworkConfig: cloudInitNetworkConfig,
-		UserData:      cloudInitUserData,
-	}); err != nil {
-		return nil, err
+func (e *Engine) CreateVirtualMachine(opts CreateVirtualMachineOptions) (*VirtualMachine, error) {
+	if opts.Name == "" || !validName.MatchString(opts.Name) {
+		return nil, ErrInvalidName
+	}
+	if opts.CPU < 1 {
+		return nil, ErrInvalidCPU
+	}
+	if opts.Memory < 128 {
+		return nil, ErrInvalidMemory
+	}
+	if opts.DiskSize < 1 {
+		return nil, ErrInvalidDisk
+	}
+	if e.FindVirtualMachine(opts.Name) != nil {
+		return nil, ErrVirtualMachineAlreadyExist
 	}
 
-	e.Printf("Copying disk from image\n")
+	img := e.FindImage(opts.Image)
+	if img == nil {
+		return nil, fmt.Errorf("%w: %q", ErrImageNotFound, opts.Image)
+	}
 
-	// copy the disk from the image
-	imageDisk, err := os.Open(image.diskPath())
+	if pulled, err := img.Pulled(); err != nil {
+		return nil, err
+	} else if !pulled {
+		e.printf("Image %q not found locally — pulling\n", opts.Image)
+		if err := img.Pull(); err != nil {
+			return nil, err
+		}
+	}
+
+	e.printf("Creating VM %q from %q\n", opts.Name, opts.Image)
+
+	// ── NICs ──────────────────────────────────────────────────────────────────
+	networks := opts.Networks
+	if len(networks) == 0 {
+		networks = []NetworkInterfaceConfig{{NetworkMode: "nat"}}
+	}
+	for i := range networks {
+		if networks[i].MACAddress == "" {
+			mac, err := RandomMAC()
+			if err != nil {
+				return nil, err
+			}
+			networks[i].MACAddress = mac
+			e.printf("NIC %d MAC: %s\n", i, mac)
+		}
+		if networks[i].PortForwards == nil {
+			networks[i].PortForwards = map[string]string{}
+		}
+	}
+	if networks[0].PortForwards["22"] == "" {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("allocate SSH port: %w", err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		networks[0].PortForwards["22"] = strconv.Itoa(port)
+		e.printf("SSH port: %s\n", networks[0].PortForwards["22"])
+	}
+
+	// ── SSH key (Ed25519) ─────────────────────────────────────────────────────
+	e.printf("Generating Ed25519 SSH key\n")
+
+	vm := &VirtualMachine{
+		Name:   opts.Name,
+		engine: e,
+		path:   e.virtualMachinePath(opts.Name),
+		Config: VirtualMachineConfig{
+			CPU:           opts.CPU,
+			Memory:        opts.Memory,
+			Image:         opts.Image,
+			SSHUser:       img.sshUser,
+			DiskSize:      opts.DiskSize,
+			Networks:      networks,
+			SharedFolders: opts.SharedFolders,
+			Ephemeral:     opts.Ephemeral,
+		},
+	}
+
+	pubKeyBytes, err := vm.generateSSHKey()
 	if err != nil {
 		return nil, err
 	}
-	defer imageDisk.Close()
 
-	virtualMachineDisk, err := os.Create(virtualMachine.diskPath())
-	if err != nil {
-		return nil, err
+	// ── Cloud-init ISO ────────────────────────────────────────────────────────
+	e.printf("Building cloud-init ISO\n")
+	userData := opts.UserData
+	if userData == "" {
+		userData = defaultCloudInitUserData(pubKeyBytes)
 	}
-	defer virtualMachineDisk.Close()
-
-	if _, err := io.Copy(virtualMachineDisk, imageDisk); err != nil {
-		return nil, err
+	if err := vm.buildCloudInit(userData, vm.Name); err != nil {
+		return nil, fmt.Errorf("build cloud-init: %w", err)
 	}
 
-	e.Printf("Resizing disk\n")
-
-	// resize the disk
-	resizeCmd := exec.Command("qemu-img", "resize", virtualMachine.diskPath(), fmt.Sprintf("%dG", virtualMachine.Config.DiskSize))
-
-	if err := resizeCmd.Run(); err != nil {
+	// ── Disk ──────────────────────────────────────────────────────────────────
+	e.printf("Copying image disk\n")
+	if err := copyFileTo(img.diskPath(), vm.diskPath()); err != nil {
 		return nil, err
 	}
 
-	// write the config file
-	if err := virtualMachine.writeConfigFile(); err != nil {
+	e.printf("Resizing disk to %d GB\n", opts.DiskSize)
+	if out, err := runQemuImg("resize", vm.diskPath(), fmt.Sprintf("%dG", opts.DiskSize)); err != nil {
+		return nil, fmt.Errorf("qemu-img resize: %w\n%s", err, out)
+	}
+
+	if err := vm.writeConfigFile(); err != nil {
 		return nil, err
 	}
 
-	return virtualMachine, nil
+	e.virtualMachines[opts.Name] = vm
+	return vm, nil
 }

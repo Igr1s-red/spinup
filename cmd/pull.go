@@ -7,28 +7,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-type pullOptions struct {
-	name          string
-	globalOptions *globalOptions
-}
-
 func newPullCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Args:  cobra.ExactArgs(1),
-		Short: "Pull an image",
-		Use:   "pull [name]",
+	return &cobra.Command{
+		Args:    cobra.ExactArgs(1),
+		Short:   "Pull an image",
+		Use:     "pull [name]",
+		Example: "  spinup pull debian:bookworm",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			globalOptions, err := newGlobalOptions(cmd)
 			if err != nil {
 				return err
 			}
 
-			opts := &pullOptions{
-				name:          args[0],
-				globalOptions: globalOptions,
-			}
-
-			if err := runPull(opts); err != nil {
+			if err := runPull(globalOptions, args[0]); err != nil {
 				fmt.Printf("Error: %s\n", err)
 				os.Exit(1)
 			}
@@ -36,22 +27,17 @@ func newPullCommand() *cobra.Command {
 			return nil
 		},
 	}
-
-	return cmd
 }
 
-func runPull(opts *pullOptions) error {
-	eng, err := newEngine(opts.globalOptions)
-	if err != nil {
-		return err
-	}
+func runPull(opts *globalOptions, name string) error {
+	eng, err := newEngine(opts)
 	if err != nil {
 		return err
 	}
 
-	img := eng.FindImage(opts.name)
+	img := eng.FindImage(name)
 	if img == nil {
-		return fmt.Errorf(`image "%s" not found`, opts.name)
+		return fmt.Errorf("image %q not found — run 'spinup images' to see available images", name)
 	}
 
 	return img.Pull()

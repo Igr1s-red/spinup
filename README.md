@@ -4,104 +4,161 @@ Spin up Linux VMs with QEMU.
 
 ## Requirements
 
-- Linux, macOS or Windows (needs testing) host OS.
-- [QEMU](https://www.qemu.org) installed and available in the image, you can install it with homebrew or your package manager of choice. spinup uses `qemu-img` binary, `qemu-system-aarch64` binary on ARM64 and `qemu-system-x86_64` binary on AMD64.
+- Linux or macOS host.
+- [QEMU](https://www.qemu.org) installed. spinup uses `qemu-img`, `qemu-system-x86_64` (AMD64), or `qemu-system-aarch64` (ARM64).
 
-## Getting started
-
-### Install spinup
-
-The only way for now is to have a working Go environment and install spinup by running this command:
+## Install
 
 ```shell
 go install github.com/Igr1s-red/spinup@latest
 ```
 
-### Create your first vitual machine
-
-Create a Debian 12 (Bookworm) virtual machine with 4 CPUs, 4096 mebibytes of ram and 20 GB of disk by running this command:
+## Quick start
 
 ```shell
-spinup run debian12 -i debian:bookworm -c 4 -m 4096 -d 20
+# Pull an image, create and start a VM
+spinup run myvm -i debian:bookworm
+
+# SSH in
+spinup ssh myvm
+
+# Run a one-off command
+spinup exec myvm -- uname -a
+
+# Stop and remove
+spinup stop myvm
+spinup remove myvm
 ```
 
-### Run a command in the virtual machine
+## Available images
 
-Run `uname -a` inside the virtual machine by running this command:
+| Image | Description |
+|---|---|
+| `arch:latest` | Arch Linux (latest Reproducible Builds cloud image) |
+| `debian:bullseye` | Debian 11 (Bullseye) — oldstable |
+| `debian:bookworm` | Debian 12 (Bookworm) — stable |
+| `debian:trixie` | Debian 13 (Trixie) — testing |
+| `fedora:latest` | Fedora (latest stable, resolved at pull time) |
+| `ubuntu:focal` | Ubuntu 20.04 LTS |
+| `ubuntu:jammy` | Ubuntu 22.04 LTS |
+| `ubuntu:noble` | Ubuntu 24.04 LTS |
 
-```shell
-spinup exec debian12 -- uname -a
-```
-
-### Connect to the virtual machine via SSH
-
-You can get SSH parameters by running this command:
-
-```shell
-spinup ssh debian12
-```
-
-On Unix systems you can quickly connect via SSH by running this command:
-
-```shell
-$(spinup ssh debian12 --command)
-```
+Images are downloaded on first use, or manually with `spinup pull <image>`.
 
 ## Commands
 
-### Create a virtual machines (`spinup run`)
-
-With `spinup run` you can create and start a new virtual machine.
-
-spinup will automatically create a pair of SSH keys and configure the chosen system via `cloud-init`. If not specified, a forward to guest port 22 will be created using a free port. This will be used to access the virtual machine via SSH.
-
-Example:
+### VM lifecycle
 
 ```shell
-spinup run debian12 -i debian:bookworm -c 4 -m 4096 -d 20
+spinup run <name> -i <image> [flags]   # create + start
+spinup start <name> [--wait] [--all]   # start (--all starts every stopped VM)
+spinup stop <name> [--all]             # ACPI powerdown, falls back to SIGKILL
+spinup restart <name>
+spinup remove <name>                   # rm is an alias
+spinup rename <old> <new>
+spinup pause <name>                    # freeze CPU in memory
+spinup resume <name>
+spinup prune [--force]                 # remove all stopped VMs (dry run without --force)
 ```
 
-Available options:
+**`spinup run` flags:**
 
-- `-c`, `--cpu` number of cpu(s) (example: `-c 4`)
-- `-d`, `--disk-size` disk size in gigabytes (GB) (example: `-d 20`)
-- `-i`, `--image` image to use (example: `-i debian:bookworm`)
-- `-m`, `--memory` ram in mebibytes (MiB) (example: `-m 4096`)
-- `-p`, `--port-forward` forward host port to the virtual machine (example: `-p 8080-80`, `-p [host]-[guest]`)
+| Flag | Description |
+|---|---|
+| `-i`, `--image` | Image to use (required) |
+| `-c`, `--cpu` | vCPU count (default 1) |
+| `-m`, `--memory` | RAM in MiB (default 512) |
+| `-d`, `--disk-size` | Disk in GB (default 10) |
+| `--network` | NIC definition, repeatable. Format: `<mode>[:<hostport>-<vmport>,...]`. Modes: `nat`, `bridged`, `internal`, `host-only` |
+| `--share` | Expose a host directory via VirtIO 9P. Format: `/host/path:tag` |
+| `--profile` | Apply a saved profile as defaults (flags override) |
+| `--user-data` | Path to a cloud-init user-data file |
+| `--wait` | Block until SSH is ready |
+| `--wait-port` | Also wait for this VM port (e.g. `80`) |
+| `--no-start` | Create the VM but don't start it |
+| `--ephemeral` | Automatically remove the VM when stopped |
 
-### Remove a virtual machine (`spinup remove|rm`)
-
-With `spinup remove` or `spinup rm` you can remove a virtual machine.
-
-Example:
+### SSH and interaction
 
 ```shell
-spinup remove debian12
+spinup ssh <name>                      # interactive shell
+spinup ssh <name> --command            # print raw ssh command for scripting: $(spinup ssh vm1 --command)
+spinup exec <name> -- <cmd>            # run a command and stream output
+spinup cp <vm>:/remote/path ./local    # download a file
+spinup cp ./local <vm>:/remote/path   # upload a file
+spinup console <name>                  # serial console (requires socat; Ctrl+] to exit)
+spinup copy-id <name> [--key file]     # install your public key into the VM
+spinup ip <name> [--all]              # print VM IP address
+spinup mount add <vm> <remote> <local> # mount via sshfs
+spinup mount remove <local>
 ```
 
-### Start a virtual machine (`spinup start`)
-
-With `spinup start` you can start a virtual machine.
-
-Example:
+### Observability
 
 ```shell
-spinup start debian12
+spinup list [--json]                   # ls is an alias
+spinup inspect <name>                  # full JSON config + runtime info
+spinup stats <name>                    # CPU/memory/disk stats (live QMP when running)
+spinup logs <name> [-f]               # stream QEMU log; Ctrl+C exits follow mode
+spinup port <name> [vm-port]          # print host port mapped to a VM port
+spinup wait <name> --running|--stopped|--wait-port <port>
 ```
 
-### Stop a virtual machine (`spinup stop`)
-
-With `spinup stop` you can stop a virtual machine.
-
-Example:
+### Images
 
 ```shell
-spinup stop debian12
+spinup images                          # list available images and pull status
+spinup pull <image>                    # download an image
+spinup update <image>                  # re-pull to get the latest build
+spinup image-rm <image>               # delete a pulled image to reclaim disk space
+```
+
+### Snapshots
+
+VM must be stopped. Snapshots are stored inside the qcow2 disk.
+
+```shell
+spinup snapshot create <vm> [name]    # auto-names with timestamp if omitted
+spinup snapshot list <vm> [--json]
+spinup snapshot restore <vm> <name>
+spinup snapshot delete <vm> <name>
+```
+
+### Port forwards
+
+Changes take effect on the next start.
+
+```shell
+spinup port-forward add <vm> <host>-<vm-port>   # e.g. 8080-80
+spinup port-forward remove <vm> <vm-port>
+spinup port-forward list <vm>
+```
+
+### Advanced
+
+```shell
+spinup clone <src> <dst>              # linked copy-on-write clone (src must be stopped)
+spinup resize <name> <gb>             # grow disk (VM must be stopped)
+spinup balloon <name> <mib>           # adjust live memory balloon target
+spinup export <name> [file]           # export disk as standalone compressed qcow2
+spinup import <file> <name>           # create a VM from an external qcow2
+spinup set-key <name>                 # rotate SSH key pair (takes effect on next boot)
+spinup ssh-config write <name>        # add VM to ~/.ssh/config (enables: ssh <name>)
+spinup ssh-config remove <name>
+spinup autostart enable|disable|status <name>
+spinup profile create|list|show|delete
+spinup doctor                         # check environment (QEMU, KVM/HVF, sshfs, etc.)
 ```
 
 ## Contributing
 
 ### Requirements
 
-- [Go](https://golang.org) installed and available in the system.
-- [Task](https://taskfile.dev) installed and available in the system.
+- [Go](https://golang.org) installed.
+- [Task](https://taskfile.dev) installed (optional; `go build .` works without it).
+
+```shell
+go build .       # build
+go test ./...    # test
+go vet ./...     # vet
+```

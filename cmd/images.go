@@ -8,8 +8,8 @@ import (
 )
 
 func newImagesCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Short: "List images",
+	return &cobra.Command{
+		Short: "List available images",
 		Use:   "images",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			globalOptions, err := newGlobalOptions(cmd)
@@ -25,15 +25,10 @@ func newImagesCommand() *cobra.Command {
 			return nil
 		},
 	}
-
-	return cmd
 }
 
 func runImages(opts *globalOptions) error {
 	eng, err := newEngine(opts)
-	if err != nil {
-		return err
-	}
 	if err != nil {
 		return err
 	}
@@ -43,33 +38,29 @@ func runImages(opts *globalOptions) error {
 	tableRows := make([][]string, 0, len(imgs))
 	for _, image := range imgs {
 		pulled := "No"
-
-		imgPulled, err := image.Pulled()
-		if err != nil {
-			return err
-		}
-
-		if imgPulled {
+		if ok, err := image.Pulled(); err != nil {
+			return fmt.Errorf("check image %s:%s: %w", image.Name, image.Version, err)
+		} else if ok {
 			pulled = "Yes"
 		}
 
+		dynamic := "-"
+		if image.Dynamic {
+			dynamic = "✓"
+		}
+
 		tableRows = append(tableRows, []string{
-			image.Name,
-			image.Version,
+			fmt.Sprintf("%s:%s", image.Name, image.Version),
 			image.Description,
+			dynamic,
 			pulled,
 		})
 	}
 
 	writeTable(&writeTableOptions{
 		writer: os.Stdout,
-		header: []string{
-			"Name",
-			"Version",
-			"Description",
-			"Pulled",
-		},
-		rows: tableRows,
+		header: []string{"Image", "Description", "Dynamic", "Pulled"},
+		rows:   tableRows,
 	})
 
 	return nil
